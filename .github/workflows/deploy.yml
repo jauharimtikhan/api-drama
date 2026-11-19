@@ -1,0 +1,181 @@
+name: Deploy Laravel 13 to VPS
+
+on:
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build and Deploy Laravel 13
+    runs-on: ubuntu-22.04
+
+    environment: production
+
+    steps:
+      # ==========================================
+      # 1. CHECKOUT
+      # ==========================================
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ==========================================
+      # 5. VERIFY BUILD
+      # ==========================================
+      - name: Verify Laravel and Vite build
+        run: |
+          set -Eeuo pipefail
+
+          test -f artisan
+          test -f composer.json
+          test -f composer.lock
+
+          echo "Laravel build verified"
+
+      # ==========================================
+      # 6. SETUP SSH AGENT
+      # ==========================================
+      - name: Setup SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.VPS_SSH_KEY }}
+
+      # ==========================================
+      # 7. CONFIGURE SSH
+      # ==========================================
+      - name: Configure SSH
+        env:
+          KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+        run: |
+          set -Eeuo pipefail
+
+          test -n "$KNOWN_HOSTS"
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      # ==========================================
+      # 8. DEPLOY TO VPS
+      # ==========================================
+      - name: Deploy Laravel application
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          DEPLOY_PATH: ${{ secrets.VPS_DEPLOY_PATH }}
+
+        run: |
+          set -Eeuo pipefail
+
+          : "${VPS_HOST:?Missing VPS_HOST}"
+          : "${VPS_USER:?Missing VPS_USER}"
+          : "${DEPLOY_PATH:?Missing VPS_DEPLOY_PATH}"
+
+          PORT="${VPS_PORT:-22}"
+
+          if ! [[ "$PORT" =~ ^[0-9]+$ ]] || \
+             (( PORT < 1 || PORT > 65535 )); then
+            echo "Invalid VPS_PORT"
+            exit 1
+          fi
+
+          case "$DEPLOY_PATH" in
+            /*) ;;
+            *)
+              echo "DEPLOY_PATH must be an absolute path."
+              exit 1
+              ;;
+          esac
+
+          REMOTE="${VPS_USER}@${VPS_HOST}"
+
+          SSH_OPTS=(
+            -p "$PORT"
+            -o BatchMode=yes
+            -o StrictHostKeyChecking=yes
+            -o ConnectTimeout=15
+          )
+
+          echo "================================"
+          echo "Starting Laravel deployment"
+          echo "================================"
+
+          # Create destination if necessary.
+          ssh "${SSH_OPTS[@]}" "$REMOTE" \
+            "mkdir -p '$DEPLOY_PATH'"
+
+          # ----------------------------------------
+          # RSYNC
+          # ----------------------------------------
+
+          rsync -az \
+            --delete \
+            --delay-updates \
+            --human-readable \
+            --itemize-changes \
+            --exclude='/.env' \
+            --exclude='/.env.*' \
+            --exclude='/storage/***' \
+            --exclude='/vendor/***' \
+            --exclude='/node_modules/***' \
+            --exclude='/.git/***' \
+            --exclude='/public/storage' \
+            -e "ssh -p $PORT -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15" \
+            ./ \
+            "$REMOTE:$DEPLOY_PATH/"
+
+          echo "Source files synchronized."
+
+          # ----------------------------------------
+          # REMOTE LARAVEL COMMANDS
+          # ----------------------------------------
+
+          ssh "${SSH_OPTS[@]}" "$REMOTE" \
+            "bash -s -- '$DEPLOY_PATH'" <<'REMOTE_SCRIPT'
+
+          set -Eeuo pipefail
+
+          APP_PATH="$1"
+
+          cd "$APP_PATH"
+
+          echo "Installing Composer dependencies..."
+
+          composer install \
+            --no-dev \
+            --prefer-dist \
+            --no-interaction \
+            --no-progress \
+            --optimize-autoloader
+
+          echo "Clearing Laravel caches..."
+
+          php artisan optimize:clear
+
+          echo "Building Laravel production caches..."
+
+          php artisan optimize
+
+          echo "Restarting Laravel queue workers..."
+
+          php artisan queue:restart
+
+          echo "Laravel deployment completed successfully."
+
+          REMOTE_SCRIPT
+
+          echo "================================"
+          echo "DEPLOYMENT SUCCESSFUL"
+          echo "================================"
